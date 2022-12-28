@@ -1,0 +1,153 @@
+- original.c -- pthread version
+- pth.1.cpp -- pthread removal
+  + We are back to simple pthread_create conversion here as pthread_join takes NULL
+    * Note that we should probably remove for loops that only have pthread_joins in them
+  + This is broken because the first stage adds more elements to the buffer than it has room for.
+- pth.2.cpp -- code repair begins
+  + Lifted the pipeline stages into their own function, ready for unfolding.
+  + Equivalent to pth.1.cpp
+- pth.3.cpp
+  + Unfolded definitions of Stage1, Stage2, and Stage3
+  + Equivalent to pth.2.cpp
+- pth.4.cpp
+  + Merged do loops
+    * Need to make sure that the variable in the condition is initialised
+    * Leave the iterator/assignment/initialisation outside the if statement
+    * Weaken the condition in the introduced if-statement (but not the while condition?)
+    * Do this for both the second and third loops; what about the first? Surely you have to apply them uniformly?
+      > I think we can argue that they're different types of do-loops; the first stage is over a simple integer that has already been initialised, whereas the second and third stages' condition argument(s) haven't been initialised so we have to bring them out of the introduced if-statement.
+      > Note also that you can't lift the assignments out of the merged do-loop because we don't know if they commute with the first stage.
+      > Note that we need to make sure that the assignments that occur between each of the loops can be moved above the merged loop.
+  + This is now equivalent to original.c
+- pth.5.cpp -- shaping begins
+  + We want to match the reads and writes (to eliminate the queues, effectively)
+    * Yes, because 1) the queues are pointless in a sequential case and b) TBB doesn't need them
+  + In order to do this, we need to unfold read_from_queue and add_to_queue
+  + Labelling (automatic or otherwise) of reads/writes is more interesting than our simple example because here our reads also update the state (i.e. they remove something from the shared state).
+    * This likely means that our simple matching approach will not work?
+- pth.6.cpp -- Now we match up reads and writes.
+  + I can't remember how we did this originally, but by the look of it, we can go down the merged loop in order.
+    * What happens in the event that a stage is skipped? Is this a valid pipeline?
+  + We end up with three cases:
+    1. a read by itself (source)
+    2. a write and a read
+    3. a write by itself (sink)
+  + This still rather assumes that we're grouping together operations that are reads and writes.
+    * Perhaps we should group together contiguous examples.
+      > In stage one, the three writes are one write.
+      > In stage two, we have a read and two writes, followed by three writes.
+      > In stage three we have a read and two writes, followed by three 
+  + How do we know what is meaningfull updating/reading code and what is just housekeeping?
+    * Perhaps we need to group also on the variables we're reading/writing?
+    * We need a third category, I think: updating, i.e. where you read and write in the same block
+      > Let's assume we don't pair updates: they're self-contained (inherently)
+    * We end up with the following cases:
+      0. an update (how do we handle those, threading-wise? Need to sort the wheat from the chaff)
+        (addTo, nr_elements, readFrom)
+      1. a read by itself
+        (addTo, capacity, readFrom)
+      2. a write and a read
+        (elements)
+      3. a write by itself (sink)
+        (elements)
+    * Leave updates (0) as they are for the moment
+    * A read by itself (1) can also be left for the moment
+    * For a write and a read (2), you replace the RHS of the read with the RHS of the write.
+    * For a write by itself (3), we leave it be for the moment
+  + Equivalent to original.c
+  + See pth.tbb.cpp: we remove updates (0) that aren't referenced anywhere else.
+
+-----------------------------------------------
+- What we need is a way of piping the output of one stage into the next.
+  + We know that my_output_1 is the same as my_input_2 because of the unfolding we've done.
+    * elem_2 can be gotten rid of, and my_input_2 can be changed to my_output_1
+    * Same for my_output_2 and my_input_2.
+  + We know that by deleting updates (see pth.tbb.cpp) that the only thing passed on between s1 and s2 is my_output_1, and similarly, between s2 and s3 is my_output_2.
+  + After lifting the stages into their own functions (pth.7.cpp), we still need to merge inputs.
+    * This could be done as part of Introduce TBB Pipe.
+      > Really ought to find out how this was done in Paraformance...
+  + Note that we need to bring my_output_1 and my_output_2 into the condition as well
+    * Could we simply remove these because they're a function of i_1?
+      > When i_1 = 0; my_output_1 = 0; and my_output_2 = 1
+      > When i_1 = S k; my_output_1 = S k; and my_output_2 = S (S k)
+      > So, you'll never reach the point where my_output_1/2 are less than 0 because i_1.
+    * I'm not sure I'm happy categorically stating this though...
+    * Remove variables that are wholly dependent on another variable;
+      > Will need to check a number of cases with this, but copying and increments should be fine.
+      > Don't need to do this, it would seem.
+-----------------------------------------------
+
+
+- pth.7.cpp
+  + Lift stages into their own functions (this is effectively to tidy up and make it very clear what the inputs and outputs are for each stage)
+  + Arguments can either be pointers (especially for inputs/outputs of the pipeline) or values
+- pth.8.cpp
+  + Merge arguments (synthesising a structure)
+    * Inputs and outputs need to be pointers
+    * Variables in between also need to be added 
+      > I originally assumed that they'd need to be values because of ordering and sharing, but it would seem that practically there is no difference if you use pointers.
+      > This has me very suspicious (for the parallel case).
+    * All stages now only take and return one thing (the synthesised struct) and can be rewritten in the form h(g(f(arg)))
+- pth.9.cpp (final version)
+  + From pth.8.cpp, we replace our do-loop that contains the pipeline with a call to tbb::parallel_pipeline.
+  + We lift the argument passed to the first stage out before the pipeline and use it.
+  + Note that inputs and outputs need to be presented as pointers (otherwise they don't update)
+  + When converting the bounding loop condition, you should now use the relevant variables in the synthesised struct
+    > The bounding condition is converted into an if-statement; the body of the first stage in the true branch, and the fc.stop in the false branch.
+  + We unfold the function calls (that we introduced because it's easier?)
+  + We could tidy up some of the nested if-statements but that's left as an exercise to the reader
+  + Note that in this case, it's a sequence of sequential pipes, there are no parallel stages
+    > We can make the second stage parallel in this case with no penalty.
+    > Further parallelisation/manipulation of the patterns should be a separate sequence of refactorings
+  + Note that serial_in/out_of_order for the second stage gets us another result (a zero on the end)
+    > serial and parallel do not
+
+-----------------------------------------------
+- pth.tbb.cpp -- our goal (with tbb pipeline in it)
+  + We need to know a few things:
+    * The 'add_to_queue' for output queue remains the same (note that we're passing them in as pointers, this could easily be a synthesised struct; perhaps we want a labelling of some description that states that its a sink?)
+    * The first stage needs to have a `fc.stop()` somewhere.
+      > We can use the condition in the introduced if-statement from the loop merge.
+    * What if we were to just remove UPDATE operations (with the assumption that they're only used in the immediate pipeline)?
+      > This side condition spares the output queue because it's used elsewhere (in the output stuff).
+    * Don't forget to convert i_1-- type things to their pointer equivalents.
+
+---------------------------------------------------------------------------------------------------
+
+- pth.7.cpp -- lift into functions
+  + All variables are local, so we can split the pipe into functions (for introducing TBB)
+  + Recall that for producing such functions we also need to generate structs
+    * We really ought to get rid of the queues. I don't like them.
+    * I've made the individual parts of the queues local variables that are passed in and returned as part of the synthesised structures.
+  + Note that we don't return capacity because we don't update it in any way.
+  + Shouldn't we have this so that you pass the result of stage n straight into stage S n?
+    * Next stage, I think. (See it as a merging of Structs and go from there.)
+    * You also need to merge the inputs as well. Do that first, then merge all the structs?
+  + Equivalent to original.c
+- pth.8.cpp -- merging structs
+  + We can merge parts of the struct according to how they're assigned/used
+  + Niggling question: how are we supposed to merge the elems in the final queue?
+  ...Actually, how exactly does this help.
+  + New thing for Friday: work out what the TBB version actually looks like and go from there.
+
+---------------------------------------------------------------------------------------------------
+
+- old.pth.4.cpp
+  + Merged do loops (should we convert these to for-loops first?)
+  + Equivalent to pth.3.cpp
+    * Wait, what?
+    * The output Queue keeps going up and the other stages don't seem to be firing.
+    * They're not firing because I've wrapped the if statements around the statement that fetches from the queues.
+    * Perhaps we should change the do-loops to for-loops first?
+      > Either way, we need to know what the iterator is
+      > Here, that's read_from_queue
+- old.pth.4.alt.cpp
+  + Converted do-loops to for-loops
+    * We need to know what the iterator is and what the initial value is.
+    * Note that in this case we need to weaken the bounds of the for-loops because in a do-loop the body executes before the bound. If you don't weaken it, the loops will not be equivalent. Would need to know how to weaken it; inequalities and numbers aren't too difficult.
+    * In this particular case, I don't think it would have a detrimental effect if we *didn't* weaken the bounds, because it would stop at the right time anyway. This is dangerous to apply generally, though.
+    * Is the if-condition in stage three wrong, Vladimir?
+  + The way I've done this doesn't work though...
+    * It either quits the loop immediately or it iterates infinitely.
+- old.pth.5.alt.cpp
+  + Merged for-loops
